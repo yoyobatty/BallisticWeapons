@@ -202,6 +202,11 @@ var float  CrouchEndTime;
 var() float JumpCrouchPenalty;   // Jump height multiplier for crouching
 var() float JumpCrouchTime;
 
+// Directional scaling for sliding
+var() float BackSlidePowerScale;      // < 1.0 to weaken backward slides
+var() float BackMaxSlideSpeedScale;   // < 1.0 to cap backward slide speed lower
+var() float BackSlideDotThreshold;    // dot threshold vs forward (negative means backwards)
+
 replication
 {
 	reliable if (Role == ROLE_Authority)
@@ -618,7 +623,6 @@ function PawnCheckBob(float DeltaTime, vector Y)
 		BobTime = 0;
 		WalkBob = WalkBob * (1 - FMin(1, 8 * deltatime));
 	}
-	log("BallisticPawn: PawnCheckBob: BobTime: "$BobTime$" WalkBob: "$WalkBob$" AppliedBob: "$AppliedBob$ " DeltaTime: "$DeltaTime);
 }
 
 //===========================================================================
@@ -1679,10 +1683,6 @@ simulated event Tick(float DT)
 	}
 	// Gore tick
 	TickGore(DT);
-
-	// Slope calculation
-	if(bAllowCrouchSliding) 
-		TickSlopeCalculation(DT);
 
 	// Dissolve DeRes corpses
 	if (bDeRes)
@@ -3263,7 +3263,7 @@ simulated function DisplayDebug(Canvas Canvas, out float YL, out float YPos)
 	Canvas.DrawText("FireState:"@GetEnum(enum'EFireAnimState', FireState));
 	YPos += YL;
 	Canvas.SetPos(4,YPos);
-	T = "Floor "$Floor$" DesiredSpeed "$DesiredSpeed$" Crouched "$bIsCrouched$" Try to uncrouch "$UncrouchTime$ " GroundSpeed "$GroundSpeed$ " WalkBob "$WalkBob;
+	T = "Floor "$Floor$" DesiredSpeed "$DesiredSpeed$" Crouched "$bIsCrouched$" Try to uncrouch "$UncrouchTime$ " GroundSpeed "$GroundSpeed$ " CrouchedPct "$CrouchedPct;
 	if ( (OnLadder != None) || (Physics == PHYS_Ladder) )
 		T=T$" on ladder "$OnLadder;
 	Canvas.DrawText(T);
@@ -3364,22 +3364,28 @@ simulated event ModifyVelocity(float DeltaTime, vector OldVelocity)
 			}
 		}
 
-
 		if (bIsSliding)
 		{
 			HandleSliding(DeltaTime);
+			TickSlopeCalculation(DeltaTime);
 		}
 		else
 		{
 			// This isn't the best way to do this, but it works for now
 			SlideStartSpeed = class'BallisticReplicationInfo'.default.PlayerGroundSpeed*1.1;
-			SlideStopSpeed = class'BallisticReplicationInfo'.default.PlayerGroundSpeed*0.1;
+			SlideStopSpeed = class'BallisticReplicationInfo'.default.PlayerGroundSpeed*default.CrouchedPct;
 			MaxSlideSpeed = class'BallisticReplicationInfo'.default.PlayerGroundSpeed*2.5;
 			if(Level.TimeSeconds > LastLandTime + 0.1)
 				LastFallingVelocity = vect(0,0,0); 
 			if (bIsCrouched)
 			{
-				CrouchedPct = default.CrouchedPct;
+				// Gradually reduce the ground speed towards the crouch speed
+				if(Physics != PHYS_Falling)
+					CrouchedPct = FClamp(CrouchedPct - DeltaTime * 5.0, default.CrouchedPct, 1.0);
+			}
+			else
+			{
+				CrouchedPct = FClamp(CrouchedPct + (DeltaTime * 100), default.CrouchedPct, 1.0);
 			}
 		}
 
@@ -3395,23 +3401,41 @@ simulated event ModifyVelocity(float DeltaTime, vector OldVelocity)
 simulated function StartSlide()
 {
     local name Anim;
+    local vector X, Y, Z;
+    local float DirDot, EffSlidePower, EffImpulse, EffBackSpeedScale;
 
 	if (!bAllowCrouchSliding)
 		return;
 
     if (!bIsSliding 
 	&& Controller.bDuck > 0 
-	&& (VSize(LastFallingVelocity) > SlideStartSpeed || VSize(Velocity) > SlideStartSpeed || SlopeAngleDeg < 0.0)
+	&& (VSize(LastFallingVelocity) >= SlideStartSpeed || VSize(Velocity) >= SlideStartSpeed || SlopeAngleDeg < 0.0)
 	&& Physics == PHYS_Walking 
 	&& (Level.TimeSeconds - LastSlideEndTime > SlideCooldownTime))
     {
 		Sprinter.DelayRecharge();
 		Sprinter.StopSprint();
 		SlideVelocity = Velocity + LastFallingVelocity * 0.5; //Blend current velocity with last falling velocity
-		SlideVelocity += Normal(SlideVelocity) * FMax(SlidePower*0.5,SlidePower * (Sprinter.Stamina / Sprinter.MaxStamina));
-		// Clamp slide velocity to max speed
-        if (VSize(SlideVelocity) > MaxSlideSpeed)
-            SlideVelocity = Normal(SlideVelocity) * MaxSlideSpeed;
+
+        // Determine direction vs forward view
+        GetAxes(GetViewRotation(), X, Y, Z);
+        DirDot = Normal(SlideVelocity) dot X;
+
+        // Effective power and max speed
+        EffSlidePower = SlidePower;
+        EffBackSpeedScale = 1.0;
+
+        // If mostly moving backwards relative to facing, weaken it
+        if (DirDot < BackSlideDotThreshold)
+        {
+            EffSlidePower *= BackSlidePowerScale;
+            EffBackSpeedScale = BackMaxSlideSpeedScale;
+            MaxSlideSpeed *= EffBackSpeedScale;
+        }
+
+        // Apply initial impulse scaled by stamina (same logic, with effective power)
+        EffImpulse = FMax(EffSlidePower * 0.5, EffSlidePower * (Sprinter.Stamina / Sprinter.MaxStamina));
+        SlideVelocity += Normal(SlideVelocity) * EffImpulse;
 		LastFallingVelocity = vect(0,0,0); 
         bIsSliding = true;
         GroundSpeed = MaxSlideSpeed;
@@ -3481,16 +3505,10 @@ simulated function HandleSliding(float DT)
 			GravityAlongSlope *= 0.5; 
 		}
 	}
-	// If going downhill, accelerate; if uphill, decelerate
 	SlideVelocity += DownSlopeVect * GravityAlongSlope * 1.5 * DT;
-
-	// Friction force
 	if (VSize(SlideVelocity) > 0.1)
 		SlideVelocity -= Normal(SlideVelocity) * DynamicFriction * -PhysicsVolume.Gravity.Z * Cos(SlopeAngleRad) * DT;
-
-	// Apply slide velocity to pawn, handle this on the pawn instead
 	Velocity = SlideVelocity;
-
 	if (VSize(Velocity) > MaxSlideSpeed)
 		Velocity = Normal(Velocity) * MaxSlideSpeed;
 
@@ -3501,116 +3519,114 @@ simulated function HandleSliding(float DT)
 defaultproperties
 {
 	bAlwaysRelevant=True
-    bCanDodge=True
-    bCanDoubleJump=True
-     MoverLeaveGrace=1.000000
-     MinDragDistance=40.000000
-     MaxPoolVelocity=20.000000
-     HighImpactVelocity=1000.000000
-     LowImpactVelocity=500.000000
-     TimeBetweenImpacts=1.000000
-	 //MinTimeBetweenPainSounds=0.600000
-     NewDeResSound=SoundGroup'BW_Core_WeaponSound.Misc.DeRes'
-     MeleeAnim="Melee_Smack"
-     Fades(0)=Texture'BW_Core_WeaponTex.Icons.stealth_8'
-     Fades(1)=Texture'BW_Core_WeaponTex.Icons.stealth_16'
-     Fades(2)=Texture'BW_Core_WeaponTex.Icons.stealth_24'
-     Fades(3)=Texture'BW_Core_WeaponTex.Icons.stealth_32'
-     Fades(4)=Texture'BW_Core_WeaponTex.Icons.stealth_40'
-     Fades(5)=Texture'BW_Core_WeaponTex.Icons.stealth_48'
-     Fades(6)=Texture'BW_Core_WeaponTex.Icons.stealth_56'
-     Fades(7)=Texture'BW_Core_WeaponTex.Icons.stealth_64'
-     Fades(8)=Texture'BW_Core_WeaponTex.Icons.stealth_72'
-     Fades(9)=Texture'BW_Core_WeaponTex.Icons.stealth_80'
-     Fades(10)=Texture'BW_Core_WeaponTex.Icons.stealth_88'
-     Fades(11)=Texture'BW_Core_WeaponTex.Icons.stealth_96'
-     Fades(12)=Texture'BW_Core_WeaponTex.Icons.stealth_104'
-     Fades(13)=Texture'BW_Core_WeaponTex.Icons.stealth_112'
-     Fades(14)=Texture'BW_Core_WeaponTex.Icons.stealth_120'
-     Fades(15)=Texture'BW_Core_WeaponTex.Icons.stealth_128'
-     UDamageSound=Sound'BW_Core_WeaponSound.Udamage.UDamageFire'
+	bCanDodge=True
+	bCanDoubleJump=True
+	MoverLeaveGrace=1.000000
+	MinDragDistance=40.000000
+	MaxPoolVelocity=20.000000
+	HighImpactVelocity=1000.000000
+	LowImpactVelocity=500.000000
+	TimeBetweenImpacts=1.000000
+	//MinTimeBetweenPainSounds=0.600000
+	NewDeResSound=SoundGroup'BW_Core_WeaponSound.Misc.DeRes'
+	MeleeAnim="Melee_Smack"
+	Fades(0)=Texture'BW_Core_WeaponTex.Icons.stealth_8'
+	Fades(1)=Texture'BW_Core_WeaponTex.Icons.stealth_16'
+	Fades(2)=Texture'BW_Core_WeaponTex.Icons.stealth_24'
+	Fades(3)=Texture'BW_Core_WeaponTex.Icons.stealth_32'
+	Fades(4)=Texture'BW_Core_WeaponTex.Icons.stealth_40'
+	Fades(5)=Texture'BW_Core_WeaponTex.Icons.stealth_48'
+	Fades(6)=Texture'BW_Core_WeaponTex.Icons.stealth_56'
+	Fades(7)=Texture'BW_Core_WeaponTex.Icons.stealth_64'
+	Fades(8)=Texture'BW_Core_WeaponTex.Icons.stealth_72'
+	Fades(9)=Texture'BW_Core_WeaponTex.Icons.stealth_80'
+	Fades(10)=Texture'BW_Core_WeaponTex.Icons.stealth_88'
+	Fades(11)=Texture'BW_Core_WeaponTex.Icons.stealth_96'
+	Fades(12)=Texture'BW_Core_WeaponTex.Icons.stealth_104'
+	Fades(13)=Texture'BW_Core_WeaponTex.Icons.stealth_112'
+	Fades(14)=Texture'BW_Core_WeaponTex.Icons.stealth_120'
+	Fades(15)=Texture'BW_Core_WeaponTex.Icons.stealth_128'
+	UDamageSound=Sound'BW_Core_WeaponSound.Udamage.UDamageFire'
 
-	 BloodFlashV=(X=1000,Y=250,Z=250)
-     ShieldFlashV=(X=750,Y=500,Z=350)
+	BloodFlashV=(X=1000,Y=250,Z=250)
+	ShieldFlashV=(X=750,Y=500,Z=350)
 
-     FootstepVolume=0.25
-     FootstepRadius=1536.000000
-	 GruntVolume=0.25
-     GruntRadius=28.000000
+	FootstepVolume=0.25
+	FootstepRadius=1536.000000
+	GruntVolume=0.25
+	GruntRadius=28.000000
 
-	 // used to play footsteps at consistent volume regardless of position
-	 // the fine sound controls, like occlusion factors and rolloff curves, are native
-	 // so we're forced into this to get the footstep behaviour we want
-	 // thankfully, it won't affect sounds we play through our weapons or attachments
-	 SoundOcclusion=OCCLUSION_None
+	// used to play footsteps at consistent volume regardless of position
+	// the fine sound controls, like occlusion factors and rolloff curves, are native
+	// so we're forced into this to get the footstep behaviour we want
+	// thankfully, it won't affect sounds we play through our weapons or attachments
+	SoundOcclusion=OCCLUSION_None
 
-	 BaseEyeHeight=30
-	 CrouchEyeHeight=19
-	 CrouchHeight=32
+	BaseEyeHeight=30
+	CrouchEyeHeight=19
+	CrouchHeight=32
 
-     CollisionRadius=22.000000
-     HeadRadius=13.000000
+	CollisionRadius=22.000000
+	HeadRadius=13.000000
 
+	DeResTime=4.000000
+	RagDeathUpKick=0.000000
+	bCanWalkOffLedges=True
+	bSpecialHUD=True
+	Visibility=64
 
-
-
-     DeResTime=4.000000
-     RagDeathUpKick=0.000000
-     bCanWalkOffLedges=True
-     bSpecialHUD=True
-     Visibility=64
+	TransientSoundVolume=0.300000
 	
-     TransientSoundVolume=0.300000
-	 
-	 StrafeScale=1.000000
-     BackpedalScale=1.000000
-     //MyFriction=4.000000
-     RagdollLifeSpan=20.000000
+	StrafeScale=1.000000
+	BackpedalScale=1.000000
+	//MyFriction=4.000000
+	RagdollLifeSpan=20.000000
 
-	// the default value of this variable is used by C++ to work out move animation rates.
-	// do not use or change the default in code - use class'BallisticReplicationInfo'.default.PlayerGroundSpeed instead.
-	// the default value is assigned from game styles as PlayerAnimationGroundSpeed
-     GroundSpeed=360.000000
+// the default value of this variable is used by C++ to work out move animation rates.
+// do not use or change the default in code - use class'BallisticReplicationInfo'.default.PlayerGroundSpeed instead.
+// the default value is assigned from game styles as PlayerAnimationGroundSpeed
+	GroundSpeed=360.000000
 
-	 LadderSpeed=280.000000
-     WaterSpeed=150.000000
-     //AirSpeed=270.000000
-     WalkingPct=0.900000
-	 CrouchedPct=0.350000
-	 JumpCrouchPenalty=0.15
-	 JumpCrouchTime=0.30
-     //DodgeSpeedFactor=1.200000
-     //DodgeSpeedZ=190.000000
+	LadderSpeed=280.000000
+	WaterSpeed=150.000000
+	//AirSpeed=270.000000
+	WalkingPct=0.900000
+	CrouchedPct=0.350000
+	JumpCrouchPenalty=0.15
+	JumpCrouchTime=0.30
+	//DodgeSpeedFactor=1.200000
+	//DodgeSpeedZ=190.000000
 
-	 SlideFriction=1.100000
-     SlideCooldownTime=0.600000
-	 SlidePower=350.000000
-	 SlideAnims(0)="SlideF"
-	 SlideAnims(1)="SlideF"
-	 SlideAnims(2)="SlideL"
-	 SlideAnims(3)="SlideR"
-	 SlideStartAnims(0)="SlideFStart"
-	 SlideStartAnims(1)="SlideFStart"
-	 SlideStartAnims(2)="SlideLStart"
-	 SlideStartAnims(3)="SlideRStart"
-	 SlideEndAnims(0)="SlideFEnd"
-	 SlideEndAnims(1)="SlideFEnd"
-	 SlideEndAnims(2)="SlideLEnd"
-	 SlideEndAnims(3)="SlideRSEnd
+	SlideFriction=1.100000
+	SlideCooldownTime=0.600000
+	SlidePower=350.000000
+	SlideAnims(0)="SlideF"
+	SlideAnims(1)="SlideF"
+	SlideAnims(2)="SlideL"
+	SlideAnims(3)="SlideR"
+	SlideStartAnims(0)="SlideFStart"
+	SlideStartAnims(1)="SlideFStart"
+	SlideStartAnims(2)="SlideLStart"
+	SlideStartAnims(3)="SlideRStart"
+	SlideEndAnims(0)="SlideFEnd"
+	SlideEndAnims(1)="SlideFEnd"
+	SlideEndAnims(2)="SlideLEnd"
+	SlideEndAnims(3)="SlideRSEnd
+	BackSlidePowerScale=0.60
+	BackMaxSlideSpeedScale=0.75
+	BackSlideDotThreshold=-0.25
 
-     Begin Object Class=KarmaParamsSkel Name=PawnKParams
-         KConvulseSpacing=(Max=2.200000)
-         KLinearDamping=0.150000
-         KAngularDamping=0.050000
-         KBuoyancy=1.000000
-         KStartEnabled=True
-         KVelDropBelowThreshold=-1.000000
-         bHighDetailOnly=False
-         KFriction=0.600000
-         KRestitution=0.300000
-         KImpactThreshold=500.000000
-     End Object
-
-     KParams=KarmaParamsSkel'BallisticProV55.BallisticPawn.PawnKParams'
-
+	Begin Object Class=KarmaParamsSkel Name=PawnKParams
+		KConvulseSpacing=(Max=2.200000)
+		KLinearDamping=0.150000
+		KAngularDamping=0.050000
+		KBuoyancy=1.000000
+		KStartEnabled=True
+		KVelDropBelowThreshold=-1.000000
+		bHighDetailOnly=False
+		KFriction=0.600000
+		KRestitution=0.300000
+		KImpactThreshold=500.000000
+	End Object
+	KParams=KarmaParamsSkel'BallisticProV55.BallisticPawn.PawnKParams'
 }
