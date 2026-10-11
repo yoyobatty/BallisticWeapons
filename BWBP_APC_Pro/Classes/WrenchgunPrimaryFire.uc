@@ -240,6 +240,9 @@ function DoFireEffect()
 		if (Other != None)
 			Aim = Rotator(HitLocation-StartTrace);
 		SpawnProjectile(StartTrace, Aim);
+		// a projectile that goes off at once can kill its own shooter: the weapon and this fire mode are gone then
+		if (Weapon == None)
+			return;
 	}
 
 	SendFireEffect(none, vect(0,0,0), StartTrace, 0);
